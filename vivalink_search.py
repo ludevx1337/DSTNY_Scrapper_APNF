@@ -1,121 +1,375 @@
-from pandas.core.reshape.concat import concat
-from selenium import webdriver
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.firefox.firefox_binary import FirefoxBinary
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-import pandas as pd
-import math
-import openpyxl
-import numpy as np
-import time
-import sys
+from __future__ import annotations
+
+import logging
 import os
-import unittest
-import csv
 import re
-import easygui
-#os.environ['MOZ_HEADLESS'] = '1'
-#choix du fichier Excel
-chemin = easygui.fileopenbox(msg=None, title='Selectionner votre fichier Excel', default='*.xlsx', filetypes='', multiple=False)
-#Connexion au site
-print("connexion au site")
-driver = webdriver.Firefox()           
-driver.get("https://store-vivalink.extranet.myopenip.fr/Qualification")
-time.sleep(1)
-elem = driver.find_element_by_id("login")
-elem.send_keys("")
-# time.sleep(0.1)
-elem = driver.find_element_by_id("password")
-elem.send_keys("")
-# time.sleep(0.1)
-elem.send_keys(Keys.RETURN)
-print("connexion reussi")
-time.sleep(.5)
-driver.get("https://store-vivalink.extranet.myopenip.fr/Qualification")
-#Read Excel file as a DataFrame
-print("démarage du process")
-data = pd.read_excel(chemin)
-df = pd.DataFrame(data, columns = ['numéro'])
-lst = []
-cols = ['type', 'derniere_action', 'operateur_attributaire', 'operateur_exploitant', 'operateur_telecom']
-def testnumero():
-    numero = str(num)
-    num1 = re.sub(r"\s+", "", numero)
-    num2 = len(numero)
-    if num1.startswith('0'):
-            return num1
-    elif num2 == 9:
-            newnum = '0' + str(num1)
-            return newnum
-    else:
-            return "0100000000"
-for num in df.numéro:
-       #numero = line.replace(" ", "")          
-        
-        #Vérifier que la zonne de recherche de numéro est presente
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Final
+
+import pandas as pd
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+
+LOGGER = logging.getLogger("societe_apnf")
+
+PHONE_COLUMN: Final = "numéro"
+SEARCH_FIELD_ID: Final = "tx_numberSearch"
+LOGIN_FIELD_ID: Final = "login"
+PASSWORD_FIELD_ID: Final = "password"
+WAITING_INDICATOR_ID: Final = "waiting-indicator"
+
+RESULT_LABELS: Final[dict[str, str]] = {
+    "type": "Type de ligne",
+    "derniere_action": "Dernière action",
+    "operateur_attributaire": "Opérateur Attributaire",
+    "operateur_exploitant": "Opérateur Exploitant",
+    "operateur_telecom": "Opérateur Commercial",
+}
+
+DATE_RE: Final = re.compile(
+    r"\b(?:"
+    r"(?P<dmy>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+    r"|(?P<ymd>\d{4}-\d{1,2}-\d{1,2})"
+    r")\b"
+)
+
+PORTABILITY_RE: Final = re.compile(r"\bport(?:a(?:bilit[ée])?)?\b", re.IGNORECASE)
+
+OPERATOR_FLOW_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(
+        r"(?:de|depuis)\s+(?P<from>[^|;\n]+?)\s+(?:vers|à|->|→)\s+"
+        r"(?P<to>[^|;\n]+?)(?=\s+(?:le|du)\s+\d|[|;\n]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?P<from>[^|;\n]+?)\s*(?:->|→)\s*(?P<to>[^|;\n]+?)(?=[|;\n]|$)",
+        re.IGNORECASE,
+    ),
+)
+
+
+@dataclass(slots=True)
+class QualificationResult:
+    type: str = ""
+    derniere_action: str = ""
+    operateur_attributaire: str = ""
+    operateur_exploitant: str = ""
+    operateur_telecom: str = ""
+    date_portabilite_recente: str = ""
+    operateur_origine: str = ""
+    operateur_destination: str = ""
+    statut_recherche: str = "OK"
+    erreur_recherche: str = ""
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "oui", "on"}
+
+
+def get_qualification_url() -> str:
+    url = os.getenv("SOCIETE_QUALIFICATION_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            "La variable SOCIETE_QUALIFICATION_URL est obligatoire. "
+            "Consultez le README.md pour la configuration."
+        )
+    return url
+
+
+def choose_excel_file() -> Path | None:
+    """Ouvre le sélecteur de fichier natif sans dépendance GUI externe."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    selected = filedialog.askopenfilename(
+        title="Sélectionner le fichier Excel de leads",
+        filetypes=[("Fichiers Excel", "*.xlsx *.xlsm"), ("Tous les fichiers", "*.*")],
+    )
+    root.destroy()
+    return Path(selected) if selected else None
+
+
+def normalize_phone(value: object) -> str | None:
+    """Normalise un numéro français sur 10 chiffres en conservant le 0 initial."""
+    if pd.isna(value):
+        return None
+
+    raw = str(value).strip()
+    if raw.endswith(".0") and raw[:-2].isdigit():
+        raw = raw[:-2]
+
+    digits = re.sub(r"\D+", "", raw)
+
+    if digits.startswith("0033"):
+        digits = "0" + digits[4:]
+    elif digits.startswith("33") and len(digits) == 11:
+        digits = "0" + digits[2:]
+
+    if len(digits) == 9:
+        digits = "0" + digits
+
+    if len(digits) == 10 and digits.startswith("0"):
+        return digits
+
+    return None
+
+
+def make_driver() -> webdriver.Remote:
+    browser = os.getenv("SOCIETE_BROWSER", "firefox").strip().lower()
+    headless = env_bool("SOCIETE_HEADLESS")
+
+    if browser == "chrome":
+        options = webdriver.ChromeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+        return webdriver.Chrome(options=options)
+
+    if browser != "firefox":
+        raise RuntimeError("SOCIETE_BROWSER doit valoir 'firefox' ou 'chrome'.")
+
+    options = webdriver.FirefoxOptions()
+    if headless:
+        options.add_argument("-headless")
+    return webdriver.Firefox(options=options)
+
+
+def wait_for_search_field(driver: webdriver.Remote, timeout: int = 60):
+    return WebDriverWait(driver, timeout).until(
+        EC.element_to_be_clickable((By.ID, SEARCH_FIELD_ID))
+    )
+
+
+def login_if_needed(driver: webdriver.Remote, url: str) -> None:
+    driver.get(url)
+
+    try:
+        login_field = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.ID, LOGIN_FIELD_ID))
+        )
+    except TimeoutException:
+        wait_for_search_field(driver)
+        return
+
+    password_field = driver.find_element(By.ID, PASSWORD_FIELD_ID)
+    username = os.getenv("SOCIETE_LOGIN", "").strip()
+    password = os.getenv("SOCIETE_PASSWORD", "")
+
+    if username and password:
+        login_field.clear()
+        login_field.send_keys(username)
+        password_field.clear()
+        password_field.send_keys(password, Keys.RETURN)
+        wait_for_search_field(driver)
+        LOGGER.info("Connexion automatisée réussie.")
+        return
+
+    LOGGER.warning(
+        "SOCIETE_LOGIN/SOCIETE_PASSWORD absents : connectez-vous manuellement "
+        "dans le navigateur. Le script reprendra dès que la zone de recherche sera disponible."
+    )
+    wait_for_search_field(driver, timeout=180)
+
+
+def xpath_literal(text: str) -> str:
+    """Échappe une chaîne pour l'utiliser comme littéral XPath."""
+    if "'" not in text:
+        return f"'{text}'"
+    if '"' not in text:
+        return f'"{text}"'
+    parts = text.split("'")
+    return "concat(" + ', "\'", '.join(f"'{part}'" for part in parts) + ")"
+
+
+def strip_label(text: str, label: str) -> str:
+    cleaned = text.strip()
+    pattern = re.compile(rf"^\s*{re.escape(label)}\s*[:\-]?\s*", re.IGNORECASE)
+    return pattern.sub("", cleaned, count=1).strip()
+
+
+def read_labeled_value(
+    driver: webdriver.Remote,
+    label: str,
+    timeout: int = 30,
+) -> str:
+    label_xpath = xpath_literal(label)
+    locator = (
+        By.XPATH,
+        f"//p[contains(normalize-space(.), {label_xpath})]",
+    )
+    element = WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located(locator)
+    )
+    return strip_label(element.text, label)
+
+
+def parse_portability(last_action: str) -> tuple[str, str, str]:
+    """Extrait, sans l'inventer, date et flux opérateur d'une action de portabilité."""
+    if not last_action or not PORTABILITY_RE.search(last_action):
+        return "", "", ""
+
+    date_match = DATE_RE.search(last_action)
+    date_value = date_match.group(0) if date_match else ""
+
+    for pattern in OPERATOR_FLOW_PATTERNS:
+        match = pattern.search(last_action)
+        if match:
+            return (
+                date_value,
+                match.group("from").strip(" :-"),
+                match.group("to").strip(" :-"),
+            )
+
+    return date_value, "", ""
+
+
+def dismiss_waiting_indicator(driver: webdriver.Remote) -> None:
+    """Attend la disparition du loader et applique un fallback compatible avec l'ancien portail."""
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.invisibility_of_element_located((By.ID, WAITING_INDICATOR_ID))
+        )
+    except TimeoutException:
+        LOGGER.debug("Loader toujours visible ; application du fallback JavaScript.")
+        driver.execute_script(
+            "const el = document.getElementById(arguments[0]); "
+            "if (el) { el.style.display = 'none'; }",
+            WAITING_INDICATOR_ID,
+        )
+
+
+def qualify_number(driver: webdriver.Remote, number: str) -> QualificationResult:
+    search = wait_for_search_field(driver)
+    search.send_keys(Keys.CONTROL, "a")
+    search.send_keys(Keys.DELETE)
+    search.send_keys(number, Keys.RETURN)
+
+    dismiss_waiting_indicator(driver)
+
+    values = {
+        field: read_labeled_value(driver, label)
+        for field, label in RESULT_LABELS.items()
+    }
+    port_date, origin, destination = parse_portability(values["derniere_action"])
+
+    return QualificationResult(
+        **values,
+        date_portabilite_recente=port_date,
+        operateur_origine=origin,
+        operateur_destination=destination,
+    )
+
+
+def build_output_path(source: Path) -> Path:
+    return source.with_name(f"{source.stem}_apnf.xlsx")
+
+
+def process_file(driver: webdriver.Remote, source: Path, url: str) -> Path:
+    data = pd.read_excel(source, engine="openpyxl")
+
+    if PHONE_COLUMN not in data.columns:
+        columns = ", ".join(map(str, data.columns))
+        raise KeyError(
+            f"Colonne obligatoire '{PHONE_COLUMN}' introuvable. "
+            f"Colonnes détectées : {columns or '(aucune)'}."
+        )
+
+    results: list[dict[str, str]] = []
+    total = len(data)
+
+    for index, raw_number in enumerate(data[PHONE_COLUMN], start=1):
+        number = normalize_phone(raw_number)
+        LOGGER.info("[%s/%s] Traitement : %s", index, total, number or raw_number)
+
+        if number is None:
+            results.append(
+                asdict(
+                    QualificationResult(
+                        statut_recherche="NUMERO_INVALIDE",
+                        erreur_recherche="Numéro absent ou format non reconnu.",
+                    )
+                )
+            )
+            continue
+
         try:
-            element = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "tx_numberSearch")))
+            result = qualify_number(driver, number)
+            results.append(asdict(result))
+        except Exception as exc:  # Une ligne en erreur ne doit pas perdre tout le fichier.
+            LOGGER.exception("Échec de la qualification du numéro %s", number)
+            results.append(
+                asdict(
+                    QualificationResult(
+                        statut_recherche="ERREUR",
+                        erreur_recherche=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+            )
         finally:
-                #fin
-            x = True
-        # recherche de la zonne de text et envoie du numéro
-        numerouno = testnumero() 
-        """ print(numerouno)
-        numerouno = str(testnumero) """
-        elem = driver.find_element_by_id("tx_numberSearch")
-        elem.send_keys(numerouno)
-        elem.send_keys(Keys.RETURN)
-        # on vient désactiver le Loading ou waiting qui s'affiche
-        driver.execute_script("document.getElementById('waiting-indicator').style.display = 'none';")
-        #verification de la presence du premier element
-        val = 60 # in seconds
-        driver.implicitly_wait(val)
+            # Le portail historique est plus fiable après rechargement entre deux recherches.
+            driver.get(url)
+
+    enriched = pd.concat(
+        [data.reset_index(drop=True), pd.DataFrame(results)],
+        axis=1,
+    )
+
+    output = build_output_path(source)
+    enriched.to_excel(output, index=False, engine="openpyxl")
+    return output
+
+
+def main() -> int:
+    configure_logging()
+
+    try:
+        url = get_qualification_url()
+        source = choose_excel_file()
+        if source is None:
+            LOGGER.info("Aucun fichier sélectionné. Arrêt.")
+            return 0
+
+        LOGGER.info("Fichier sélectionné : %s", source)
+        LOGGER.info("Démarrage du navigateur.")
+        driver = make_driver()
+
         try:
-            element = WebDriverWait(driver, 60).until(EC.presence_of_element_located((By.XPATH, "/html/body/div[1]/div[5]/div[1]/div/div[2]/div/div[1]/div/p")))
+            login_if_needed(driver, url)
+            output = process_file(driver, source, url)
         finally:
-                #fin
-            x = True
-        # print("récupération des datas")
-        typelign = driver.find_element_by_xpath('/html/body/div[1]/div[5]/div[1]/div/div[2]/div/div[1]/div/p').text
-        lastact = driver.find_element_by_xpath('/html/body/div[1]/div[5]/div[1]/div/div[2]/div/div[2]/div[1]/p').text
-        operatrib = driver.find_element_by_xpath('/html/body/div[1]/div[5]/div[1]/div/div[2]/div/div[3]/div[1]/p').text
-        opeexploit = driver.find_element_by_xpath('/html/body/div[1]/div[5]/div[1]/div/div[2]/div/div[3]/div[2]/p').text
-        opecom = driver.find_element_by_xpath('/html/body/div[1]/div[5]/div[1]/div/div[2]/div/div[3]/div[3]/p').text
-        # on récupé le string de chaque résultat pour récupérer cequi nous interesse
-        #type de ligne
-        typelig = str(typelign)
-        a = re.search("Type de ligne\n", typelig)
-        typelign1 = typelig[:a.start()] + typelig[a.end():]
-        # derniere action
-        last = str(lastact)
-        b = re.search("Dernière action\n", last)
-        lastact1 = last[:b.start()] + last[b.end():]
-        # operateur attributaire
-        operatatri = str(operatrib)
-        c = re.search("Opérateur Attributaire\n", operatatri)
-        operatatrib1 = operatatri[:c.start()] + operatatri[c.end():]
-        # operateur exploitant
-        opeexploi = str(opeexploit)
-        d = re.search("Opérateur Exploitant\n", opeexploi)
-        opeexploit1 = opeexploi[:d.start()] + opeexploi[d.end():]
-        # operateur exploitant
-        opeco = str(opecom)
-        e = re.search("Opérateur Commercial\n", opeco)
-        opecom1 = opeco[:e.start()] + opeco[e.end():]
-        #print("ajout des datas au fichier")
-         # on stock le resultat dans le tableau vide lst            
-        resultat = lst.append([typelign1, lastact1, operatatrib1, opeexploit1, opecom1])
-        #on reactualise la page car autrement ça ne marche pas:(
-        driver.get("https://store-vivalink.extranet.myopenip.fr/Qualification")
-#on definie df1 avec lst et les collone
-df1 = pd.DataFrame(lst, columns=cols)
-#on agrege df1 et data
-final = concat([data,df1], axis=1)
-#on balance en excel
-final.to_excel(chemin+"out.xlsx", index = False, header=True)
-driver.close()
-print("opération terminé")
+            driver.quit()
+
+        LOGGER.info("Opération terminée : %s", output)
+        print(f"\nFichier généré : {output}")
+        return 0
+
+    except KeyboardInterrupt:
+        LOGGER.warning("Opération interrompue par l'utilisateur.")
+        return 130
+    except Exception as exc:
+        LOGGER.exception("Erreur fatale : %s", exc)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
